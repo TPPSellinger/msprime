@@ -1,5 +1,5 @@
 /*
-** Copyright (C) 2014-2018 University of Oxford
+** Copyright (C) 2014-2020 University of Oxford
 **
 ** This file is part of msprime.
 **
@@ -189,56 +189,6 @@ out:
     if (ret_samples != NULL) {
         PyMem_Free(ret_samples);
     }
-    return ret;
-}
-
-static PyObject *
-convert_integer_list(size_t *list, size_t size)
-{
-    PyObject *ret = NULL;
-    PyObject *l = NULL;
-    PyObject *py_int = NULL;
-    size_t j;
-
-    l = PyList_New(size);
-    if (l == NULL) {
-        goto out;
-    }
-    for (j = 0; j < size; j++) {
-        py_int = Py_BuildValue("n", (Py_ssize_t) list[j]);
-        if (py_int == NULL) {
-            Py_DECREF(l);
-            goto out;
-        }
-        PyList_SET_ITEM(l, j, py_int);
-    }
-    ret = l;
-out:
-    return ret;
-}
-
-static PyObject *
-convert_float_list(double *list, size_t size)
-{
-    PyObject *ret = NULL;
-    PyObject *l = NULL;
-    PyObject *py_float = NULL;
-    size_t j;
-
-    l = PyList_New(size);
-    if (l == NULL) {
-        goto out;
-    }
-    for (j = 0; j < size; j++) {
-        py_float = Py_BuildValue("d", list[j]);
-        if (py_float == NULL) {
-            Py_DECREF(l);
-            goto out;
-        }
-        PyList_SET_ITEM(l, j, py_float);
-    }
-    ret = l;
-out:
     return ret;
 }
 
@@ -1965,164 +1915,62 @@ RecombinationMap_dealloc(RecombinationMap* self)
 }
 
 static int
+double_PyArray_converter(PyObject *in, PyObject **out)
+{
+    PyObject *ret = PyArray_FROMANY(in, NPY_FLOAT64, 1, 1, NPY_ARRAY_IN_ARRAY);
+    if (ret == NULL) {
+        return NPY_FAIL;
+    }
+    *out = ret;
+    return NPY_SUCCEED;
+}
+
+static int
 RecombinationMap_init(RecombinationMap *self, PyObject *args, PyObject *kwds)
 {
     int ret = -1;
     int err;
-    static char *kwlist[] = {"num_loci", "positions", "rates", NULL};
-    Py_ssize_t size, j;
+    static char *kwlist[] = {"positions", "rates", "discrete", NULL};
+    Py_ssize_t size;
     PyObject *py_positions = NULL;
     PyObject *py_rates = NULL;
-    double *positions = NULL;
-    double *rates = NULL;
-    unsigned int num_loci = 0;
-    PyObject *item;
+    double *positions;
+    double *rates;
+    int discrete = false;
 
     self->recomb_map = NULL;
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "IO!O!", kwlist,
-            &num_loci, &PyList_Type, &py_positions, &PyList_Type,
-            &py_rates)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&O&p", kwlist,
+            double_PyArray_converter, &py_positions,
+            double_PyArray_converter, &py_rates,
+            &discrete)) {
         goto out;
     }
-    if (PyList_Size(py_positions) != PyList_Size(py_rates)) {
+
+    size = PyObject_Size(py_positions);
+    if (size != PyObject_Size(py_rates)) {
         PyErr_SetString(PyExc_ValueError,
             "positions and rates list must be the same length");
         goto out;
     }
-    size = PyList_Size(py_positions);
-    positions = PyMem_Malloc(size * sizeof(double));
-    rates = PyMem_Malloc(size * sizeof(double));
-    if (positions == NULL || rates == NULL) {
-        PyErr_NoMemory();
-        goto out;
-    }
-    for (j = 0; j < size; j++) {
-        item = PyList_GetItem(py_positions, j);
-        if (!PyNumber_Check(item)) {
-            PyErr_SetString(PyExc_TypeError, "position must be a number");
-            goto out;
-        }
-        positions[j] = PyFloat_AsDouble(item);
-        item = PyList_GetItem(py_rates, j);
-        if (!PyNumber_Check(item)) {
-            PyErr_SetString(PyExc_TypeError, "rates must be a number");
-            goto out;
-        }
-        rates[j] = PyFloat_AsDouble(item);
-    }
+
+    positions = PyArray_DATA((PyArrayObject *) py_positions);
+    rates = PyArray_DATA((PyArrayObject *) py_rates);
+
     self->recomb_map = PyMem_Malloc(sizeof(recomb_map_t));
     if (self->recomb_map == NULL) {
         PyErr_NoMemory();
         goto out;
     }
-    err = recomb_map_alloc(self->recomb_map, (uint32_t) num_loci,
-            positions[size - 1], positions, rates, size);
+    err = recomb_map_alloc(self->recomb_map,
+            positions[size - 1], positions, rates, size, discrete);
     if (err != 0) {
         handle_library_error(err);
         goto out;
     }
     ret = 0;
 out:
-    if (positions != NULL) {
-        PyMem_Free(positions);
-    }
-    if (rates != NULL) {
-        PyMem_Free(rates);
-    }
-    return ret;
-}
-
-static PyObject *
-RecombinationMap_genetic_to_physical(RecombinationMap *self, PyObject *args)
-{
-    PyObject *ret = NULL;
-    double genetic_x, physical_x;
-    uint32_t num_loci;
-
-    if (RecombinationMap_check_recomb_map(self) != 0) {
-        goto out;
-    }
-    num_loci = recomb_map_get_num_loci(self->recomb_map);
-    if (!PyArg_ParseTuple(args, "d", &genetic_x)) {
-        goto out;
-    }
-    if (genetic_x < 0 || genetic_x > num_loci) {
-        PyErr_SetString(PyExc_ValueError,
-                "coordinates must be 0 <= x <= num_loci");
-        goto out;
-    }
-    physical_x = recomb_map_genetic_to_phys(self->recomb_map, genetic_x);
-    ret = Py_BuildValue("d", physical_x);
-out:
-    return ret;
-}
-
-static PyObject *
-RecombinationMap_physical_to_genetic(RecombinationMap *self, PyObject *args)
-{
-    PyObject *ret = NULL;
-    double genetic_x, physical_x, sequence_length;
-
-    if (RecombinationMap_check_recomb_map(self) != 0) {
-        goto out;
-    }
-    sequence_length = recomb_map_get_sequence_length(self->recomb_map);
-    if (!PyArg_ParseTuple(args, "d", &physical_x)) {
-        goto out;
-    }
-    if (physical_x < 0 || physical_x > sequence_length) {
-        PyErr_SetString(PyExc_ValueError,
-            "coordinates must be 0 <= x <= sequence_length");
-        goto out;
-    }
-    genetic_x = recomb_map_phys_to_genetic(self->recomb_map, physical_x);
-    ret = Py_BuildValue("d", genetic_x);
-out:
-    return ret;
-}
-
-static PyObject *
-RecombinationMap_physical_to_discrete_genetic(RecombinationMap *self, PyObject *args)
-{
-    PyObject *ret = NULL;
-    double physical_x, sequence_length;
-    int err;
-    uint32_t locus;
-
-    if (RecombinationMap_check_recomb_map(self) != 0) {
-        goto out;
-    }
-    if (!PyArg_ParseTuple(args, "d", &physical_x)) {
-        goto out;
-    }
-    sequence_length = recomb_map_get_sequence_length(self->recomb_map);
-    if (physical_x < 0 || physical_x > sequence_length) {
-        PyErr_SetString(PyExc_ValueError,
-            "coordinates must be 0 <= x <= sequence_length");
-        goto out;
-    }
-    err = recomb_map_phys_to_discrete_genetic(self->recomb_map, physical_x, &locus);
-    if (err != 0) {
-        handle_library_error(err);
-        goto out;
-    }
-    ret = Py_BuildValue("k", (unsigned long) locus);
-out:
-    return ret;
-}
-
-
-static PyObject *
-RecombinationMap_get_per_locus_recombination_rate(RecombinationMap *self)
-{
-    PyObject *ret = NULL;
-
-    if (RecombinationMap_check_recomb_map(self) != 0) {
-        goto out;
-    }
-    ret = Py_BuildValue("d",
-        recomb_map_get_per_locus_recombination_rate(self->recomb_map));
-out:
+    Py_XDECREF(py_positions);
+    Py_XDECREF(py_rates);
     return ret;
 }
 
@@ -2136,20 +1984,6 @@ RecombinationMap_get_total_recombination_rate(RecombinationMap *self)
     }
     ret = Py_BuildValue("d",
         recomb_map_get_total_recombination_rate(self->recomb_map));
-out:
-    return ret;
-}
-
-static PyObject *
-RecombinationMap_get_num_loci(RecombinationMap *self)
-{
-    PyObject *ret = NULL;
-
-    if (RecombinationMap_check_recomb_map(self) != 0) {
-        goto out;
-    }
-    ret = Py_BuildValue("k",
-        (unsigned long) recomb_map_get_num_loci(self->recomb_map));
 out:
     return ret;
 }
@@ -2182,32 +2016,44 @@ out:
 }
 
 static PyObject *
+RecombinationMap_get_discrete(RecombinationMap *self)
+{
+    PyObject *ret = NULL;
+
+    if (RecombinationMap_check_recomb_map(self) != 0) {
+        goto out;
+    }
+    ret = Py_BuildValue("i", recomb_map_get_discrete(self->recomb_map));
+out:
+    return ret;
+}
+
+static PyObject *
 RecombinationMap_get_positions(RecombinationMap *self)
 {
     PyObject *ret = NULL;
-    double *positions = NULL;
-    size_t size;
+    PyObject *arr = NULL;
+    npy_intp size;
     int err;
 
     if (RecombinationMap_check_recomb_map(self) != 0) {
         goto out;
     }
     size = recomb_map_get_size(self->recomb_map);
-    positions = PyMem_Malloc(size * sizeof(double));
-    if (positions == NULL) {
-        PyErr_NoMemory();
+    arr = PyArray_SimpleNew(1, &size, NPY_FLOAT64);
+    if (arr == NULL) {
         goto out;
     }
-    err = recomb_map_get_positions(self->recomb_map, positions);
+    err = recomb_map_get_positions(self->recomb_map,
+            PyArray_DATA((PyArrayObject *) arr));
     if (err != 0) {
         handle_library_error(err);
         goto out;
     }
-    ret = convert_float_list(positions, size);
+    ret = arr;
+    arr = NULL;
 out:
-    if (positions != NULL) {
-        PyMem_Free(positions);
-    }
+    Py_XDECREF(arr);
     return ret;
 }
 
@@ -2215,29 +2061,27 @@ static PyObject *
 RecombinationMap_get_rates(RecombinationMap *self)
 {
     PyObject *ret = NULL;
-    double *rates = NULL;
-    size_t size;
+    PyObject *arr = NULL;
+    npy_intp size;
     int err;
 
     if (RecombinationMap_check_recomb_map(self) != 0) {
         goto out;
     }
     size = recomb_map_get_size(self->recomb_map);
-    rates = PyMem_Malloc(size * sizeof(double));
-    if (rates == NULL) {
-        PyErr_NoMemory();
+    arr = PyArray_SimpleNew(1, &size, NPY_FLOAT64);
+    if (arr == NULL) {
         goto out;
     }
-    err = recomb_map_get_rates(self->recomb_map, rates);
+    err = recomb_map_get_rates(self->recomb_map, PyArray_DATA((PyArrayObject *) arr));
     if (err != 0) {
         handle_library_error(err);
         goto out;
     }
-    ret = convert_float_list(rates, size);
+    ret = arr;
+    arr = NULL;
 out:
-    if (rates != NULL) {
-        PyMem_Free(rates);
-    }
+    Py_XDECREF(arr);
     return ret;
 }
 
@@ -2246,22 +2090,9 @@ static PyMemberDef RecombinationMap_members[] = {
 };
 
 static PyMethodDef RecombinationMap_methods[] = {
-    {"genetic_to_physical", (PyCFunction) RecombinationMap_genetic_to_physical,
-        METH_VARARGS, "Converts the specified value into physical coordinates."},
-    {"physical_to_genetic", (PyCFunction) RecombinationMap_physical_to_genetic,
-        METH_VARARGS, "Converts the specified value into genetic coordinates."},
-    {"physical_to_discrete_genetic",
-        (PyCFunction) RecombinationMap_physical_to_discrete_genetic,
-        METH_VARARGS, "Converts the specified value into discete genetic coordinates."},
     {"get_total_recombination_rate",
         (PyCFunction) RecombinationMap_get_total_recombination_rate, METH_NOARGS,
         "Returns the total product of physical distance times recombination rate"},
-    {"get_per_locus_recombination_rate",
-        (PyCFunction) RecombinationMap_get_per_locus_recombination_rate,
-        METH_NOARGS,
-        "Returns the recombination rate between loci implied by this map"},
-    {"get_num_loci", (PyCFunction) RecombinationMap_get_num_loci, METH_NOARGS,
-        "Returns the number discrete loci in the genetic map."},
     {"get_size", (PyCFunction) RecombinationMap_get_size, METH_NOARGS,
         "Returns the number of physical  positions in this map."},
     {"get_sequence_length", (PyCFunction) RecombinationMap_get_sequence_length, METH_NOARGS,
@@ -2272,6 +2103,9 @@ static PyMethodDef RecombinationMap_methods[] = {
     {"get_rates",
         (PyCFunction) RecombinationMap_get_rates, METH_NOARGS,
         "Returns the rates in this recombination map."},
+    {"get_discrete",
+        (PyCFunction) RecombinationMap_get_discrete, METH_NOARGS,
+        "Returns the value of discrete in this recombination map."},
     {NULL}  /* Sentinel */
 };
 
@@ -2728,7 +2562,8 @@ Simulator_parse_simulation_model(Simulator *self, PyObject *py_model)
                 alpha, truncation_point);
     }
 
-    is_sweep_genic_selection = PyObject_RichCompareBool(py_name, sweep_genic_selection_s, Py_EQ);
+    is_sweep_genic_selection = PyObject_RichCompareBool(py_name,
+            sweep_genic_selection_s, Py_EQ);
     if (is_sweep_genic_selection == -1) {
         goto out;
     }
@@ -3247,7 +3082,7 @@ Simulator_get_model(Simulator *self)
         Py_DECREF(value);
         value = NULL;
     } else if (model->type == MSP_MODEL_SWEEP) {
-        value = Py_BuildValue("i", model->params.sweep.locus);
+        value = Py_BuildValue("d", model->params.sweep.locus);
         if (value == NULL) {
             goto out;
         }
@@ -3283,18 +3118,6 @@ Simulator_set_model(Simulator *self, PyObject *args)
         goto out;
     }
     ret = Py_BuildValue("");
-out:
-    return ret;
-}
-
-static PyObject *
-Simulator_get_num_loci(Simulator *self)
-{
-    PyObject *ret = NULL;
-    if (Simulator_check_sim(self) != 0) {
-        goto out;
-    }
-    ret = Py_BuildValue("k", (unsigned long) msp_get_num_loci(self->sim));
 out:
     return ret;
 }
@@ -3348,13 +3171,14 @@ out:
 }
 
 static PyObject *
-Simulator_get_recombination_rate(Simulator  *self)
+Simulator_get_sequence_length(Simulator *self)
 {
     PyObject *ret = NULL;
     if (Simulator_check_sim(self) != 0) {
         goto out;
     }
-    ret = Py_BuildValue("d", msp_get_recombination_rate(self->sim));
+    ret = Py_BuildValue("n", (Py_ssize_t) recomb_map_get_sequence_length(
+                &self->sim->recomb_map));
 out:
     return ret;
 }
@@ -3475,31 +3299,28 @@ static PyObject *
 Simulator_get_num_migration_events(Simulator  *self)
 {
     PyObject *ret = NULL;
-    size_t *num_migration_events = NULL;
-    size_t num_populations;
+    PyObject *arr = NULL;
     int err;
+    npy_intp size;
 
     if (Simulator_check_sim(self) != 0) {
         goto out;
     }
-    num_populations = msp_get_num_populations(self->sim);
-    num_migration_events = PyMem_Malloc(
-        num_populations * num_populations * sizeof(size_t));
-    if (num_migration_events == NULL) {
-        PyErr_NoMemory();
+    size = msp_get_num_populations(self->sim);
+    size *= size;
+    arr = PyArray_SimpleNew(1, &size, NPY_UINTP);
+    if (arr == NULL) {
         goto out;
     }
-    err = msp_get_num_migration_events(self->sim, num_migration_events);
+    err = msp_get_num_migration_events(self->sim, PyArray_DATA((PyArrayObject *) arr));
     if (err != 0) {
         handle_library_error(err);
         goto out;
     }
-    ret = convert_integer_list(num_migration_events,
-            num_populations * num_populations);
+    ret = arr;
+    arr = NULL;
 out:
-    if (num_migration_events != NULL) {
-        PyMem_Free(num_migration_events);
-    }
+    Py_XDECREF(arr);
     return ret;
 }
 
@@ -3622,7 +3443,7 @@ Simulator_individual_to_python(Simulator *self, segment_t *ind)
     u = ind;
     j = 0;
     while (u != NULL) {
-        t = Py_BuildValue("(I,I,I,I)", u->left, u->right, u->value,
+        t = Py_BuildValue("(d,d,I,I)", u->left, u->right, u->value,
                 u->population_id);
         if (t == NULL) {
             Py_DECREF(l);
@@ -3685,29 +3506,27 @@ static PyObject *
 Simulator_get_breakpoints(Simulator *self)
 {
     PyObject *ret = NULL;
-    size_t *breakpoints = NULL;
-    size_t num_breakpoints;
+    PyObject *arr = NULL;
+    npy_intp num_breakpoints;
     int err;
 
     if (Simulator_check_sim(self) != 0) {
         goto out;
     }
     num_breakpoints = msp_get_num_breakpoints(self->sim);
-    breakpoints = PyMem_Malloc(num_breakpoints * sizeof(size_t));
-    if (breakpoints == NULL) {
-        PyErr_NoMemory();
+    arr = PyArray_SimpleNew(1, &num_breakpoints, NPY_UINTP);
+    if (arr == NULL) {
         goto out;
     }
-    err = msp_get_breakpoints(self->sim, breakpoints);
+    err = msp_get_breakpoints(self->sim, PyArray_DATA((PyArrayObject *) arr));
     if (err != 0) {
         handle_library_error(err);
         goto out;
     }
-    ret = convert_integer_list(breakpoints, num_breakpoints);
+    ret = arr;
+    arr = NULL;
 out:
-    if (breakpoints != NULL) {
-        PyMem_Free(breakpoints);
-    }
+    Py_XDECREF(arr);
     return ret;
 }
 
@@ -3715,29 +3534,29 @@ static PyObject *
 Simulator_get_migration_matrix(Simulator *self)
 {
     PyObject *ret = NULL;
-    double *migration_matrix = NULL;
-    size_t N;
+    PyObject *arr = NULL;
+    npy_intp N2;
     int err;
 
     if (Simulator_check_sim(self) != 0) {
         goto out;
     }
-    N = msp_get_num_populations(self->sim);
-    migration_matrix = PyMem_Malloc(N * N * sizeof(double));
-    if (migration_matrix == NULL) {
-        PyErr_NoMemory();
+    N2 = msp_get_num_populations(self->sim);
+    N2 *= N2;
+    // TODO return 2d numpy array and fix the breakage
+    arr = PyArray_SimpleNew(1, &N2, NPY_FLOAT64);
+    if (arr == NULL) {
         goto out;
     }
-    err = msp_get_migration_matrix(self->sim, migration_matrix);
+    err = msp_get_migration_matrix(self->sim, PyArray_DATA((PyArrayObject *)arr));
     if (err != 0) {
         handle_library_error(err);
         goto out;
     }
-    ret = convert_float_list(migration_matrix, N * N);
+    ret = arr;
+    arr = NULL;
 out:
-    if (migration_matrix != NULL) {
-        PyMem_Free(migration_matrix);
-    }
+    Py_XDECREF(arr);
     return ret;
 }
 
@@ -4090,8 +3909,6 @@ static PyMethodDef Simulator_methods[] = {
             "Sets the simulation model." },
     {"get_model", (PyCFunction) Simulator_get_model, METH_NOARGS,
             "Returns the simulation model" },
-    {"get_num_loci", (PyCFunction) Simulator_get_num_loci, METH_NOARGS,
-            "Returns the number of loci" },
     {"get_store_migrations",
             (PyCFunction) Simulator_get_store_migrations, METH_NOARGS,
             "Returns True if the simulator should store migration records." },
@@ -4101,9 +3918,8 @@ static PyMethodDef Simulator_methods[] = {
             "Returns the number of populations." },
     {"get_num_labels", (PyCFunction) Simulator_get_num_labels, METH_NOARGS,
             "Returns the number of labels." },
-    {"get_recombination_rate",
-            (PyCFunction) Simulator_get_recombination_rate, METH_NOARGS,
-            "Returns the recombination rate." },
+    {"get_sequence_length", (PyCFunction) Simulator_get_sequence_length, METH_NOARGS,
+        "Returns the sequence length for this simulator."},
     {"get_segment_block_size",
             (PyCFunction) Simulator_get_segment_block_size, METH_NOARGS,
             "Returns segment block size." },

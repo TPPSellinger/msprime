@@ -13,6 +13,7 @@ import time
 import ast
 
 import scipy.special
+import scipy.stats
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -30,11 +31,15 @@ import argparse
 import msprime.cli as cli
 import msprime
 
-import pylab 
-import scipy.stats as stats
 
 def flatten(l):
     return [x for sublist in l for x in sublist]
+
+
+def scale_breakpoints(df, factor):
+    def scale(points):
+        return [factor * x for x in points]
+    df['breakpoints'] = df['breakpoints'].map(scale)
 
 
 def harmonic_number(n):
@@ -131,6 +136,85 @@ def subsample_simplify_slim_treesequence(ts, sample_sizes):
     return ts
 
 
+def run_dtwf_coalescent_stats(**kwargs):
+    df = pd.DataFrame()
+    for model in ["hudson", "dtwf"]:
+        kwargs["model"] = model
+        print("Running: ", kwargs)
+        data = collections.defaultdict(list)
+        replicates = msprime.simulate(**kwargs)
+        for ts in replicates:
+            t_mrca = np.zeros(ts.num_trees)
+            t_intervals = []
+            for tree in ts.trees():
+                t_mrca[tree.index] = tree.time(tree.root)
+                t_intervals.append(tree.interval)
+            data["tmrca_mean"].append(np.mean(t_mrca))
+            data["num_trees"].append(ts.num_trees)
+            data["intervals"].append(t_intervals)
+            data["model"].append(model)
+        df = df.append(pd.DataFrame(data))
+    return df
+
+
+def make_test_dir(test_name):
+    basedir = os.path.join("tmp__NOBACKUP__", test_name)
+    if not os.path.exists(basedir):
+        os.mkdir(basedir)
+    return basedir
+
+
+def plot_qq(v1, v2):
+    sm.graphics.qqplot(v1)
+    sm.qqplot_2samples(v1, v2, line="45")
+
+
+def plot_breakpoints_hist(v1, v2, v1_name, v2_name):
+    sns.kdeplot(v1, color='b', label=v1_name, shade=True, legend=False)
+    sns.kdeplot(v2, color='r', label=v2_name, shade=True, legend=False)
+    pyplot.legend(loc='upper right')
+
+
+def all_breakpoints_in_replicates(replicates):
+    return [right for intervals in replicates for left, right in intervals]
+
+
+def plot_dtwf_coalescent_stats(basedir, df):
+    df_hudson = df[df.model == "hudson"]
+    df_dtwf = df[df.model == "dtwf"]
+    for stat in ["tmrca_mean", "num_trees"]:
+        plot_qq(df_hudson[stat], df_dtwf[stat])
+        f = os.path.join(basedir, "{}.png".format(stat))
+        pyplot.savefig(f, dpi=72)
+        pyplot.close('all')
+
+    hudson_breakpoints = all_breakpoints_in_replicates(df_hudson["intervals"])
+    dtwf_breakpoints = all_breakpoints_in_replicates(df_dtwf["intervals"])
+    if len(hudson_breakpoints) > 0 or len(dtwf_breakpoints) > 0:
+        plot_breakpoints_hist(
+            hudson_breakpoints, dtwf_breakpoints, "hudson", "dtwf")
+        f = os.path.join(basedir, "breakpoints.png")
+        pyplot.savefig(f, dpi=72)
+        pyplot.close('all')
+
+
+def plot_tree_intervals(basedir, df):
+    fig, ax_arr = pyplot.subplots(2, 1)
+    for subplot_idx, model in enumerate(["hudson", "dtwf"]):
+        intervals = df[df.model == model]["intervals"][0]
+        for i, interval in enumerate(intervals):
+            left, right = interval
+            ax_arr[subplot_idx].set_title(model)
+            ax_arr[subplot_idx].set_ylabel("tree index")
+            ax_arr[subplot_idx].plot([left, right], [i, i], c='grey')
+
+    ax_arr[1].set_xlabel("tree interval")
+    pyplot.tight_layout()
+    f = os.path.join(basedir, "breakpoints.png")
+    pyplot.savefig(f, dpi=72)
+    pyplot.close('all')
+
+
 class SimulationVerifier(object):
     """
     Class to compare msprime against ms to ensure that the same distributions
@@ -217,8 +301,26 @@ class SimulationVerifier(object):
     def _run_mshot_coalescent_stats(self, args):
         return self._exec_coalescent_stats("./data/msHOT_summary_stats", args)
 
-    def _run_msprime_coalescent_stats(self, args):
-        print("\t msprime:", args)
+    def _run_msprime_coalescent_stats(self, **kwargs):
+        print("\t msprime:", kwargs)
+        if "num_replicates" in kwargs:
+            replicates = kwargs["num_replicates"]
+            num_trees = [0 for i in range(replicates)]
+            breakpoints = [0 for i in range(replicates)]
+            for i, ts in enumerate(msprime.simulate(**kwargs)):
+                num_trees[i] = ts.num_trees
+                breakpoints[i] = list(ts.breakpoints())
+        else:
+            ts = msprime.simulate(**kwargs)
+            num_trees = [ts.num_trees]
+            breakpoints = [list(ts.breakpoints)]
+
+        d = {"num_trees": num_trees, "breakpoints": breakpoints}
+        df = pd.DataFrame(d)
+        return df
+
+    def _run_mspms_coalescent_stats(self, args):
+        print("\t mspms:", args)
         runner = cli.get_mspms_runner(args.split())
         sim = runner.get_simulator()
         rng = msprime.RandomGenerator(random.randint(1, 2**32 - 1))
@@ -258,35 +360,26 @@ class SimulationVerifier(object):
             os.mkdir(output_dir)
         return os.path.join(output_dir, "_".join(args[1:]))
 
-    def _plot_qq(self, v1, v2):
-        sm.graphics.qqplot(v1)
-        sm.qqplot_2samples(v1, v2, line="45")
-
-    def _plot_breakpoints_hist(self, v1, v2, v1_name, v2_name):
-        sns.kdeplot(flatten(v1), color='b', label=v1_name, shade=True, legend=False)
-        sns.kdeplot(flatten(v2), color='r', label=v2_name, shade=True, legend=False)
-        pyplot.legend(loc='upper right')
-
     def _plot_stats(self, key, stats_type, df1, df2, df1_name, df2_name):
         assert set(df1.columns.values) == set(df2.columns.values)
         for stat in df1.columns.values:
             v1 = df1[stat]
             v2 = df2[stat]
             if stat == "breakpoints":
-                self._plot_breakpoints_hist(v1, v2, df1_name, df2_name)
+                plot_breakpoints_hist(flatten(v1), flatten(v2), df1_name, df2_name)
             else:
-                self._plot_qq(v1, v2)
+                plot_qq(v1, v2)
             f = self._build_filename(key, stats_type, stat)
             pyplot.savefig(f, dpi=72)
             pyplot.close('all')
 
     def _run_coalescent_stats(self, key, args):
-        df_msp = self._run_msprime_coalescent_stats(args)
+        df_msp = self._run_mspms_coalescent_stats(args)
         df_ms = self._run_ms_coalescent_stats(args)
         self._plot_stats(key, "coalescent", df_msp, df_ms, "msp", "ms")
 
     def _run_variable_recombination_coalescent_stats(self, key, args):
-        df_msp = self._run_msprime_coalescent_stats(args)
+        df_msp = self._run_mspms_coalescent_stats(args)
         df_mshot = self._run_mshot_coalescent_stats(args)
         self._plot_stats(
             key, "recomb map coalescent",
@@ -607,7 +700,7 @@ class SimulationVerifier(object):
             same_root_count_last = np.zeros(seq_length)
             low_recombination_rate = 0.000001
             recomb_map = msprime.RecombinationMap.uniform_map(
-                seq_length, low_recombination_rate, num_loci=seq_length)
+                seq_length, low_recombination_rate, discrete=True)
             replicates = msprime.simulate(
                 sample_size=sample_size,
                 recombination_map=recomb_map,
@@ -1100,7 +1193,7 @@ class SimulationVerifier(object):
             print("running for m =", m)
             T1 = np.zeros(num_replicates)
             num_trees1 = np.zeros(num_replicates)
-            recomb_map = msprime.RecombinationMap.uniform_map(1, 1, num_loci=m)
+            recomb_map = msprime.RecombinationMap.uniform_map(m, 1 / m, discrete=True)
             reps = msprime.simulate(
                 n, recombination_map=recomb_map, num_replicates=num_replicates)
             for j, ts in enumerate(reps):
@@ -1496,35 +1589,14 @@ class SimulationVerifier(object):
         self._instances["dtwf_vs_pedigree_long_region"] = f
 
     def run_dtwf_coalescent_comparison(self, test_name, **kwargs):
-        df = pd.DataFrame()
-        for model in ["hudson", "dtwf"]:
-            kwargs["model"] = model
-            print("Running: ", kwargs)
-            data = collections.defaultdict(list)
-            replicates = msprime.simulate(**kwargs)
-            for ts in replicates:
-                t_mrca = np.zeros(ts.num_trees)
-                for tree in ts.trees():
-                    t_mrca[tree.index] = tree.time(tree.root)
-                data["tmrca_mean"].append(np.mean(t_mrca))
-                data["num_trees"].append(ts.num_trees)
-                data["model"].append(model)
-            df = df.append(pd.DataFrame(data))
+        basedir = make_test_dir(test_name)
+        df = run_dtwf_coalescent_stats(**kwargs)
+        plot_dtwf_coalescent_stats(basedir, df)
 
-        basedir = os.path.join("tmp__NOBACKUP__", test_name)
-        if not os.path.exists(basedir):
-            os.mkdir(basedir)
-
-        df_hudson = df[df.model == "hudson"]
-        df_dtwf = df[df.model == "dtwf"]
-        for stat in ["tmrca_mean", "num_trees"]:
-            v1 = df_hudson[stat]
-            v2 = df_dtwf[stat]
-            sm.graphics.qqplot(v1)
-            sm.qqplot_2samples(v1, v2, line="45")
-            f = os.path.join(basedir, "{}.png".format(stat))
-            pyplot.savefig(f, dpi=72)
-            pyplot.close('all')
+    def run_dtwf_coalescent_tree_interval_comparison(self, test_name, **kwargs):
+        basedir = make_test_dir(test_name)
+        df = run_dtwf_coalescent_stats(**kwargs)
+        plot_tree_intervals(basedir, df)
 
     def add_dtwf_vs_coalescent_single_locus(self):
         """
@@ -1535,6 +1607,59 @@ class SimulationVerifier(object):
                 "dtwf_vs_coalescent_single_locus", sample_size=10, Ne=1000,
                 num_replicates=300)
         self._instances["dtwf_vs_coalescent_single_locus"] = f
+
+    def add_dtwf_vs_coalescent_recomb_discrete_hotspots(self):
+        """
+        Checks the DTWF against the standard coalescent with a
+        discrete recombination map with variable rates.
+        """
+        test_name = "dtwf_vs_coalescent_discrete_hotspots"
+
+        def f():
+            recombination_map = msprime.RecombinationMap(
+                positions=[0, 100, 500, 900, 1200, 1500, 2000],
+                rates=[0.00001, 0, 0.0002, 0.00005, 0, 0.001, 0],
+                discrete=True)
+
+            self.run_dtwf_coalescent_comparison(
+                test_name, sample_size=10, Ne=1000,
+                recombination_map=recombination_map,
+                num_replicates=300)
+        self._instances[test_name] = f
+
+    def add_dtwf_vs_coalescent_recomb_continuous_hotspots(self):
+        """
+        Checks the DTWF against the standard coalescent with a
+        continuous recombination map with variable rates.
+        """
+        test_name = "dtwf_vs_coalescent_continuous_hotspots"
+
+        def f():
+            recombination_map = msprime.RecombinationMap(
+                positions=[0, 0.1, 0.5, 0.9, 1.2, 1.5, 2.0],
+                rates=[0.00001, 0, 0.0002, 0.00005, 0, 0.001, 0])
+
+            self.run_dtwf_coalescent_comparison(
+                test_name, sample_size=10, Ne=1000,
+                recombination_map=recombination_map,
+                num_replicates=300)
+        self._instances[test_name] = f
+
+    def add_dtwf_vs_coalescent_single_forced_recombination(self):
+        test_name = "dtwf_vs_coalescent_single_forced_recombination"
+
+        def f():
+            recombination_map = msprime.RecombinationMap(
+                positions=[0, 100, 101, 201],
+                rates=[0, 1, 0, 0],
+                discrete=True)
+
+            self.run_dtwf_coalescent_single_replicate(
+                    test_name, sample_size=10, Ne=10,
+                    num_replicates=1,
+                    recombination_map=recombination_map)
+
+        self._instances[test_name] = f
 
     def add_dtwf_vs_coalescent_low_recombination(self):
         """
@@ -1590,8 +1715,8 @@ class SimulationVerifier(object):
                         )
                     )
 
-        recombination_map = msprime.RecombinationMap(
-                [0, num_loci], [recombination_rate, 0], num_loci=num_loci)
+        recombination_map = msprime.RecombinationMap.uniform_map(
+                                num_loci, recombination_rate, discrete=True)
 
         if migration_matrix is None:
             default_mig_rate = 0.05
@@ -1617,27 +1742,29 @@ class SimulationVerifier(object):
             msprime.PopulationConfiguration(sample_size=10, initial_size=1000),
             msprime.PopulationConfiguration(sample_size=10, initial_size=1000)]
         recombination_map = msprime.RecombinationMap(
-                [0, int(1e6)], [1e-8, 0], num_loci=int(1e8))
+                [0, int(1e6)], [1e-8, 0])
         demographic_events = [
             msprime.MassMigration(
                 time=300, source=1, destination=0, proportion=1.0)]
 
+        test_name = "dtwf_vs_coalescent_2_pops_massmigration"
+
         def f():
             self.run_dtwf_coalescent_comparison(
-                "dtwf_vs_coalescent_2_pops_massmigrations",
+                test_name,
                 population_configurations=population_configurations,
                 demographic_events=demographic_events,
                 # Ne=0.5,
                 num_replicates=300,
                 recombination_map=recombination_map)
-        self._instances["dtwf_vs_coalescent_2_pops_massmigration"] = f
+        self._instances[test_name] = f
 
     def add_dtwf_vs_coalescent_2_pop_growth(self):
         population_configurations = [
             msprime.PopulationConfiguration(
                 sample_size=10, initial_size=1000, growth_rate=0.01)]
         recombination_map = msprime.RecombinationMap(
-                [0, int(5e7)], [1e-8, 0], num_loci=int(5e7))
+                [0, int(5e7)], [1e-8, 0], discrete=True)
 
         def f():
             self.run_dtwf_coalescent_comparison(
@@ -1654,7 +1781,7 @@ class SimulationVerifier(object):
             msprime.PopulationConfiguration(
                 sample_size=10, initial_size=initial_size, growth_rate=-0.01)]
         recombination_map = msprime.RecombinationMap(
-            [0, int(1e7)], [1e-8, 0], num_loci=int(1e7))
+            [0, int(1e7)], [1e-8, 0], discrete=True)
         demographic_events = [
             msprime.PopulationParametersChange(
                 time=200, initial_size=initial_size, growth_rate=0.01, population_id=0)
@@ -1674,7 +1801,7 @@ class SimulationVerifier(object):
             msprime.PopulationConfiguration(sample_size=5, initial_size=1000),
             msprime.PopulationConfiguration(sample_size=5, initial_size=1000)]
         recombination_map = msprime.RecombinationMap(
-                [0, int(1e6)], [1e-8, 0], num_loci=int(1e8))
+                [0, int(1e6)], [1e-8, 0])
         # migration_matrix = [[0, 0.1], [0.1, 0]]
 
         demographic_events = [
@@ -1711,7 +1838,7 @@ class SimulationVerifier(object):
         num_loci = np.random.randint(1e5, 1e7)
         rho = 1e-8
         recombination_map = msprime.RecombinationMap(
-                [0, num_loci], [rho, 0], num_loci=num_loci)
+                [0, num_loci], [rho, 0], discrete=True)
 
         population_configurations = []
         for i in range(N):
@@ -1877,7 +2004,7 @@ class SimulationVerifier(object):
 
         num_loci = int(num_loci)
         recombination_map = msprime.RecombinationMap(
-                [0, num_loci], [recombination_rate, 0], num_loci=num_loci)
+                [0, num_loci], [recombination_rate, 0], discrete=True)
         slim_args['RHO'] = recombination_rate
         slim_args['NUM_LOCI'] = num_loci
 
@@ -2016,94 +2143,7 @@ class SimulationVerifier(object):
             sfs=[
                 0.418425, 0.121938, 0.092209, 0.070954, 0.056666, 0.047179,
                 0.040545, 0.035631, 0.031841, 0.028832, 0.026796, 0.028985])
- def compare_xi_beta_ARGs(self, sample_size, L, r, alpha, scenario):
-        """
-        Runs simulations of the xi beta model and compares to the expected ARGs.
-        """
-        Ne=10e4
-        if scenario == 0 :
-            for rep in range(0, 1):
-                ts = msprime.simulate(sample_size, model=msprime.BetaCoalescent(alpha=alpha), recombination_rate=r, Ne=Ne, length=L) # 
-                ts_tree_length_x_seq = []
-                for tree in ts.trees():
-                    ts_tree_length_x_seq.append((tree.total_branch_length*(tree.interval[1]-tree.interval[0])/10e4))
-        if scenario == 1 :
-            for rep in range(0, 1):
-                ts = msprime.simulate(population_configurations=[msprime.PopulationConfiguration( sample_size=sample_size, initial_size=0.5, growth_rate=0.05)], model=msprime.BetaCoalescent(alpha=alpha), recombination_rate=r, Ne=Ne, length=L) # 
-                ts_tree_length_x_seq = []
-                for tree in ts.trees():
-                    ts_tree_length_x_seq.append((tree.total_branch_length*(tree.interval[1]-tree.interval[0])/10e4))
-        if scenario == 2 :
-            for rep in range(0, 1):
-                ts = msprime.simulate(population_configurations=[msprime.PopulationConfiguration( sample_size=sample_size, initial_size=0.5, growth_rate=-0.05)], model=msprime.BetaCoalescent(alpha=alpha), recombination_rate=r, Ne=Ne, length=L) # 
-                ts_tree_length_x_seq = []
-                for tree in ts.trees():
-                    ts_tree_length_x_seq.append((tree.total_branch_length*(tree.interval[1]-tree.interval[0])/10e4))
 
-        test_ARGs = stats.probplot( ts_tree_length_x_seq, dist = stats.expon(Ne*r), plot = pylab)
-        figname = " ".join(["QQ_plot_xi_beta_scenario_",str(scenario+1),"_rep_nb_",str(rep+1),"_alpha_",str(alpha),".png"])
-        pylab.savefig(figname)
-        pylab.close()
-
-    def compare_xi_dirac_ARGs(self, sample_size, L, r, psi, c, scenario):
-        """
-        Runs simulations of the xi beta model and compares to the expected ARGs.
-        """
-        Ne=10e4
-        if scenario == 0 :
-           for rep in range(0, 1):
-               ts = msprime.simulate(sample_size, model=msprime.DiracCoalescent(Ne, psi=0.99, c=0), recombination_rate=r, Ne=Ne, length=L) # 
-               ts_tree_length_x_seq = []
-               for tree in ts.trees():
-                   ts_tree_length_x_seq.append((tree.total_branch_length*(tree.interval[1]-tree.interval[0])/10e4))
-        if scenario == 1 :
-           for rep in range(0, 1):
-               ts = msprime.simulate( population_configurations=[msprime.PopulationConfiguration( sample_size=sample_size, initial_size=0.5, growth_rate=0.05)], model=msprime.DiracCoalescent(Ne, psi=0.99, c=0), recombination_rate=r, Ne=Ne, length=L) # 
-               ts_tree_length_x_seq = []
-               for tree in ts.trees():
-                   ts_tree_length_x_seq.append((tree.total_branch_length*(tree.interval[1]-tree.interval[0])/10e4))
-        if scenario == 2 :
-           for rep in range(0, 1):
-               ts = msprime.simulate( population_configurations=[msprime.PopulationConfiguration( sample_size=sample_size, initial_size=0.5, growth_rate=-0.05)], model=msprime.DiracCoalescent(Ne, psi=0.99, c=0), recombination_rate=r, Ne=Ne, length=L) # 
-               ts_tree_length_x_seq = []
-               for tree in ts.trees():
-                   ts_tree_length_x_seq.append((tree.total_branch_length*(tree.interval[1]-tree.interval[0])/10e4))
-
-        test_ARGs = stats.probplot( ts_tree_length_x_seq, dist = stats.expon(Ne*r), plot = pylab)
-        figname = " ".join(["QQ_plot_xi_dirac_scenario_",str(scenario+1),"_rep_nb_",str(rep+1),"_psi_",str(psi),".png"])
-        pylab.savefig(figname)
-        pylab.close() 
-
-    def run_xi_beta_ARGs(self):
-        for scenario in range(0, 3):
-            self.compare_xi_beta_ARGs(sample_size=10, L=10e5, r=1e-8, alpha=1.01, scenario=scenario)
-            self.compare_xi_beta_ARGs(sample_size=10, L=10e5, r=1e-8, alpha=1.3, scenario=scenario)
-            self.compare_xi_beta_ARGs(sample_size=10, L=10e5, r=1e-8, alpha=1.6, scenario=scenario)
-            self.compare_xi_beta_ARGs(sample_size=10, L=10e5, r=1e-8, alpha=1.9, scenario=scenario)
-
-    def run_xi_dirac_ARGs(self):
-        for scenario in range(0, 3):
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.1, c=0.9, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.3, c=0.9, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.6, c=0.9, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.9, c=0.9, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.1, c=0.5, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.3, c=0.5, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.6, c=0.5, scenario=scenario)
-            self.compare_xi_dirac_ARGs(sample_size=10, L=10e5, r=1e-8, psi=0.9, c=0.5, scenario=scenario)
-
-
-    def add_xi_beta_ARGs(self):
-        """
-        Adds a check for xi_beta Ancestral Recombination Graph
-        """
-        self.run_xi_beta_ARGs()
-
-    def add_xi_dirac_ARGs(self):
-        """
-        Adds a check for xi_dirac Ancestral Recombination Graph
-        """
-        self.run_xi_dirac_ARGs()
     def add_xi_dirac_expected_sfs(self):
         """
         Adds a check for xi_dirac matching expected SFS calculations.
@@ -2152,6 +2192,186 @@ class SimulationVerifier(object):
         ax.legend((l1[0], l2[0]), ("Expected", "Observed"))
         pyplot.savefig(f, dpi=72)
         pyplot.close('all')
+
+    def verify_breakpoint_distribution(
+            self, basedir, name, sample_size, Ne, r, L, model, growth_rate=0):
+        """
+        Verifies that the number of recombination breakpoints is proportional to
+        the total branch length across all trees.
+        """
+        if not os.path.exists(basedir):
+            os.mkdir(basedir)
+        ts = msprime.simulate(
+            Ne=Ne, recombination_rate=r, length=L,
+            population_configurations=[
+                msprime.PopulationConfiguration(
+                    sample_size=sample_size, initial_size=Ne,
+                    growth_rate=growth_rate)],
+            model=model)
+        empirical = []
+        for tree in ts.trees():
+            area = tree.total_branch_length * tree.span
+            empirical.append(area)
+
+        scipy.stats.probplot(
+            empirical, dist=scipy.stats.expon(Ne * r), plot=pyplot)
+        path = os.path.join(basedir, f"{name}_growth={growth_rate}.png")
+        print("Writing", path)
+        pyplot.savefig(path)
+        pyplot.close('all')
+
+    def run_hudson_breakpoints(self):
+        basedir = "tmp__NOBACKUP__/hudson_breakpoints"
+        self.verify_breakpoint_distribution(
+            basedir, "single_pop_n_50", sample_size=50, Ne=10**4, r=1e-8, L=10**6,
+            model="hudson")
+        self.verify_breakpoint_distribution(
+            basedir, "single_pop_n_100", sample_size=100, Ne=10**4, r=1e-8, L=10**6,
+            model="hudson")
+        # Add a growth rate with a higher recombination rate so
+        # we still get decent numbers of trees
+        self.verify_breakpoint_distribution(
+            basedir, "single_pop_n_100_growth",
+            sample_size=100, Ne=10**4, r=1e-7, L=10**6,
+            model="hudson", growth_rate=0.05)
+
+    def run_xi_beta_breakpoints(self):
+        basedir = "tmp__NOBACKUP__/xi_beta_breakpoints"
+        for alpha in [1.01, 1.3, 1.6, 1.9]:
+            self.verify_breakpoint_distribution(
+                basedir, f"n=100_alpha={alpha}", sample_size=100, Ne=10**4, r=1e-8,
+                L=10**6, model=msprime.BetaCoalescent(alpha=alpha))
+            # Add a growth rate with a higher recombination rate so
+            # we still get decent numbers of trees
+            self.verify_breakpoint_distribution(
+                basedir, f"n=100_alpha={alpha}", sample_size=100, Ne=10**4, r=1e-7,
+                L=10**6, model=msprime.BetaCoalescent(alpha=alpha),
+                growth_rate=0.05)
+
+    def run_xi_dirac_breakpoints(self):
+        basedir = "tmp__NOBACKUP__/xi_dirac_breakpoints"
+        for psi in [0.1, 0.3, 0.6, 0.9]:
+            for c in [0.9, 0.5]:
+                self.verify_breakpoint_distribution(
+                    basedir, f"n=100_psi={psi}_c={c}",
+                    sample_size=100, Ne=10**4, r=1e-8,
+                    L=10**6, model=msprime.DiracCoalescent(psi=psi, c=c))
+                # Add a growth rate with a higher recombination rate so
+                # we still get decent numbers of trees
+                self.verify_breakpoint_distribution(
+                    basedir, f"n=100_psi={psi}_c={c}",
+                    sample_size=100, Ne=10**4, r=1e-7,
+                    L=10**6, model=msprime.DiracCoalescent(psi=psi, c=c),
+                    growth_rate=0.05)
+
+    def run_cont_discrete_comparison(self, key, model,
+                                     discrete_recomb_map,
+                                     cont_recomb_map):
+        sample_size = 10
+        num_replicates = 400
+        df_discrete = self._run_msprime_coalescent_stats(
+                        num_replicates=num_replicates, sample_size=sample_size,
+                        model=model, recombination_map=discrete_recomb_map)
+        df_cont = self._run_msprime_coalescent_stats(
+                        num_replicates=num_replicates, sample_size=sample_size,
+                        model=model, recombination_map=cont_recomb_map)
+
+        discrete_length = discrete_recomb_map.get_sequence_length()
+        cont_length = cont_recomb_map.get_sequence_length()
+        scale_breakpoints(df_cont, discrete_length / cont_length)
+        self._plot_stats(key, "compare continuous and discrete coordinates",
+                         df_discrete, df_cont, "discrete", "continuous")
+
+    def run_uniform_recomb_cont_discrete_comparison(self, key, model):
+        discrete_recomb_map = msprime.RecombinationMap.uniform_map(
+                                2000000, 1e-5, discrete=True)
+        cont_recomb_map = msprime.RecombinationMap.uniform_map(
+                                1, 2000000 * 1e-5, discrete=False)
+
+        self.run_cont_discrete_comparison(
+                key, model, discrete_recomb_map, cont_recomb_map)
+
+    def run_variable_recomb_cont_discrete_comparison(self, key, model):
+        r = 1e-5
+        discrete_positions = [0, 10000, 50000, 150000, 200000]
+        discrete_rates = [0.0, r, 5 * r, r / 2, 0.0]
+        cont_positions = [x / 200000 for x in discrete_positions]
+        cont_rates = [x * 200000 for x in discrete_rates]
+
+        discrete_recomb_map = msprime.RecombinationMap(
+                                discrete_positions, discrete_rates,
+                                discrete=True)
+
+        cont_recomb_map = msprime.RecombinationMap(
+                            cont_positions, cont_rates, discrete=False)
+
+        self.run_cont_discrete_comparison(
+                key, model, discrete_recomb_map, cont_recomb_map)
+
+    def run_continuous_discrete_same_scale(self, key, model):
+        discrete_recomb_map = msprime.RecombinationMap.uniform_map(
+                                2000000, 1e-5, discrete=True)
+        cont_recomb_map = msprime.RecombinationMap.uniform_map(
+                                2000000, 1e-5, discrete=False)
+        self.run_cont_discrete_comparison(
+                key, model, discrete_recomb_map, cont_recomb_map)
+
+    def add_cont_discrete_both_same_scale(self):
+        tests = [
+            ("hudson_cont_discrete_same_scale", "hudson"),
+            ("dtwf_cont_discrete_same_scale", "dtwf"),
+        ]
+
+        def make_runner(key, model):
+            return lambda: self.run_continuous_discrete_same_scale(key, model)
+
+        for key, model in tests:
+            self._instances[key] = make_runner(key, model)
+
+    def add_continuous_discrete_comparisons(self):
+        """
+        Adds checks comparing equivalent simulations in discrete space
+        and scaled up continuous space.
+        """
+        uniform_tests = [
+            ("hudson_uniform_recomb_cont_discrete", "hudson"),
+            ("dtwf_uniform_recomb_cont_discrete", "dtwf"),
+        ]
+
+        variable_tests = [
+            ("hudson_variable_recomb_cont_discrete", "hudson"),
+            ("dtwf_variable_recomb_cont_discrete", "dtwf"),
+        ]
+
+        def make_uniform_runner(key, model):
+            return lambda: self.run_uniform_recomb_cont_discrete_comparison(key, model)
+
+        def make_variable_runner(key, model):
+            return lambda: self.run_variable_recomb_cont_discrete_comparison(key, model)
+
+        for key, model in uniform_tests:
+            self._instances[key] = make_uniform_runner(key, model)
+
+        for key, model in variable_tests:
+            self._instances[key] = make_variable_runner(key, model)
+
+    def add_hudson_breakpoints(self):
+        """
+        Adds a check for xi_beta recombination breakpoints
+        """
+        self._instances["hudson_breakpoints"] = self.run_hudson_breakpoints
+
+    def add_xi_beta_breakpoints(self):
+        """
+        Adds a check for xi_beta recombination breakpoints
+        """
+        self._instances["xi_beta_breakpoints"] = self.run_xi_beta_breakpoints
+
+    def add_xi_dirac_breakpoints(self):
+        """
+        Adds a check for xi_dirac recombination breakpoints
+        """
+        self._instances["xi_dirac_breakpoints"] = self.run_xi_dirac_breakpoints
 
     def run_xi_beta_expected_sfs(self):
         self.compare_xi_beta_sfs(
@@ -2440,6 +2660,9 @@ def run_tests(args):
         "1000 1000 -t 2.0 -I 2 500 500 2 -es 0.01 1 0.75 -eg 0.02 1 5.0 "
         "-em 0.02 3 1 1")
     verifier.add_ms_instance(
+        "gene-conversion-1-r0",
+        "100 10000 -t 5.0 -r 0 2501 -c 10 1")
+    verifier.add_ms_instance(
         "gene-conversion-1",
         "100 10000 -t 5.0 -r 0.01 2501 -c 1000 1")
     verifier.add_ms_instance(
@@ -2540,6 +2763,10 @@ def run_tests(args):
         "random2", num_replicates=10**4, num_demographic_events=10)
     # verifier.add_random_instance("random2", num_populations=3)
 
+    # Add tests comparing continuous and discrete coordinates
+    verifier.add_continuous_discrete_comparisons()
+    verifier.add_cont_discrete_both_same_scale()
+
     # Add analytical checks
     verifier.add_s_analytical_check()
     verifier.add_pi_analytical_check()
@@ -2571,6 +2798,9 @@ def run_tests(args):
 
     # DTWF checks against coalescent.
     verifier.add_dtwf_vs_coalescent_single_locus()
+    verifier.add_dtwf_vs_coalescent_recomb_discrete_hotspots()
+    verifier.add_dtwf_vs_coalescent_recomb_continuous_hotspots()
+    verifier.add_dtwf_vs_coalescent_single_forced_recombination()
     verifier.add_dtwf_vs_coalescent_low_recombination()
     verifier.add_dtwf_vs_coalescent_2_pops_massmigration()
     verifier.add_dtwf_vs_coalescent_2_pop_growth()
@@ -2615,11 +2845,12 @@ def run_tests(args):
         verifier.add_dtwf_vs_coalescent_random_instance(
             "dtwf_vs_coalescent_random_4",
             num_populations=1, num_replicates=200, num_demographic_events=8)
-        
-#Check ARGs
-    verifier.add_xi_beta_ARGs()
-    verifier.add_xi_dirac_ARGs()
-    
+
+    verifier.add_hudson_breakpoints()
+    # Check Xi coalesesent recombination breakpoint distributions
+    verifier.add_xi_beta_breakpoints()
+    verifier.add_xi_dirac_breakpoints()
+
     # DTWF checks against SLiM
     # TODO: Add back multi-pop tests of DTWF vs. SLiM when full diploid
     # simulations are implemented.
